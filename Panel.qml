@@ -1,5 +1,4 @@
 import QtQuick
-import QtQuick.Controls
 import Quickshell
 import Quickshell.Io
 import qs.Commons
@@ -30,7 +29,7 @@ Panel {
   readonly property var tiers: ["max", "xhigh", "high", "medium"]
   readonly property var thresholdKeys: ["xhighAt", "highAt", "mediumAt"]
 
-  property var state: null
+  property var record: null
   property double nowMs: Date.now()
   property bool cursorActive: false
   // 0 is the automation switch in the hero, 1..3 the threshold rows.
@@ -49,10 +48,10 @@ Panel {
     highAt: pct(effective("highAt", 60)),
     mediumAt: pct(effective("mediumAt", 80))
   }
-  readonly property real percent: state && state.percent !== null && state.percent !== undefined
-    && isFinite(Number(state.percent)) ? Number(state.percent) : -1
-  readonly property string tier: state ? String(state.tier || "") : ""
-  readonly property string status: state ? String(state.status || "") : ""
+  readonly property real percent: record && record.percent !== null && record.percent !== undefined
+    && isFinite(Number(record.percent)) ? Number(record.percent) : -1
+  readonly property string tier: record ? String(record.tier || "") : ""
+  readonly property string status: record ? String(record.status || "") : ""
   readonly property bool alarming: automationOn && tier === "medium"
 
   function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)) }
@@ -163,8 +162,8 @@ Panel {
   // --------------------------------------------------------------- content
 
   function resetMs() {
-    if (!state || String(state.resetsAt || "") === "") return -1
-    var ms = new Date(String(state.resetsAt)).getTime()
+    if (!record || String(record.resetsAt || "") === "") return -1
+    var ms = new Date(String(record.resetsAt)).getTime()
     return isFinite(ms) ? ms - root.nowMs : -1
   }
 
@@ -200,7 +199,7 @@ Panel {
     var parts = []
     var reset = resetMs()
     if (reset > 0) parts.push("Resets in " + formatDuration(reset))
-    var age = state ? formatAge(ageMs(state.usageUpdatedAt)) : ""
+    var age = record ? formatAge(ageMs(record.usageUpdatedAt)) : ""
     if (age !== "") parts.push("usage as of " + age)
     return parts.join(" · ")
   }
@@ -218,17 +217,17 @@ Panel {
 
   function footerText() {
     if (refreshing) return "Refreshing usage…"
-    var age = state ? formatAge(ageMs(state.updatedAt)) : ""
+    var age = record ? formatAge(ageMs(record.updatedAt)) : ""
     return (age !== "" ? "Synced " + age + " · " : "") + "r refresh · h/l adjust"
   }
 
   function parseState(content) {
     try {
       var parsed = JSON.parse(String(content || ""))
-      root.state = parsed && typeof parsed === "object" ? parsed : null
+      root.record = parsed && typeof parsed === "object" ? parsed : null
     } catch (e) {
       console.warn("claude-effort", "Ignoring bad state file", root.statePath, e)
-      root.state = null
+      root.record = null
     }
     root.refreshing = false
   }
@@ -250,7 +249,7 @@ Panel {
     printErrors: false
     onFileChanged: reload()
     onLoaded: root.parseState(text())
-    onLoadFailed: root.state = null
+    onLoadFailed: root.record = null
   }
 
   Timer {
