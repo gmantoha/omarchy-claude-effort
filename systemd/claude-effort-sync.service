@@ -1,0 +1,6 @@
+[Unit]
+Description=Adjust Claude Code's effort cap from Claude session usage
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/claude-effort-sync

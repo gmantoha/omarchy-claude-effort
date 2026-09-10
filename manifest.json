@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.gmantoha.claude-effort",
+  "name": "Claude effort",
+  "version": "1.0.0",
+  "author": "gmantoha",
+  "license": "MIT",
+  "description": "Steers Claude Code's effort level from the Claude session usage that the Agents panel collects.",
+  "kinds": ["bar-widget"],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Claude effort",
+    "description": "Shows the effort tier Claude Code is running at, the session usage behind it, and the thresholds that switch tiers.",
+    "category": "AI",
+    "aliases": ["claude-effort", "effort"],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "automation": "On",
+      "xhighAt": 30,
+      "highAt": 60,
+      "mediumAt": 80
+    },
+    "schema": [
+      { "key": "automation", "type": "enum", "label": "Automatic effort", "options": ["On", "Off"], "defaultValue": "On", "description": "When Off, Claude Code runs at max regardless of usage." },
+      { "key": "xhighAt", "type": "integer", "label": "xhigh from (% of session)", "min": 0, "max": 100, "step": 5, "defaultValue": 30, "description": "Below this Claude runs at max." },
+      { "key": "highAt", "type": "integer", "label": "high from (% of session)", "min": 0, "max": 100, "step": 5, "defaultValue": 60 },
+      { "key": "mediumAt", "type": "integer", "label": "medium from (% of session)", "min": 0, "max": 100, "step": 5, "defaultValue": 80 }
+    ]
+  }
+}

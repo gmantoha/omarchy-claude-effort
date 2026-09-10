@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch Omarchy's Claude usage record and adjust Claude Code's effort cap
+
+[Path]
+PathChanged=%h/.local/state/omarchy/agents/usage/claude.json
+Unit=claude-effort-sync.service
+
+[Install]
+WantedBy=default.target

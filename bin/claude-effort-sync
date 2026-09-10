@@ -1,0 +1,229 @@
+#!/bin/bash
+#
+# claude-effort-sync — pick Claude Code's effort level from the Claude session
+# usage that Omarchy's agents panel collects (`omarchy agent usage-update`).
+#
+# Reads the "Session (5-hour)" percentage from
+#   ~/.local/state/omarchy/agents/usage/claude.json
+# and writes a matching `maxEffortLevel` cap into ~/.claude/settings.json.
+# Claude Code reloads that file live and applies the cap before every request,
+# so running sessions follow the tier as well as new ones. The base effort is
+# pinned to `max` via CLAUDE_CODE_EFFORT_LEVEL in the same settings file, so
+# the cap alone decides the effective level:
+#
+#     usage < xhighAt            -> max      (no cap)
+#     xhighAt  .. < highAt       -> xhigh
+#     highAt   .. < mediumAt     -> high
+#     mediumAt .. 100%           -> medium
+#
+# The thresholds (defaults 30 / 60 / 80) and the automation switch live on the
+# "io.github.gmantoha.claude-effort" bar widget entry in ~/.config/omarchy/shell.json, which
+# the Claude effort panel edits. Every run also writes a state record for that
+# panel to ~/.local/state/claude-effort-sync/state.json.
+#
+# Usage: claude-effort-sync [--refresh] [--percent <n>] [--thresholds a,b,c]
+#                           [--automation on|off] [--dry-run] [--quiet]
+#   --refresh          run `omarchy agent usage-update --limits-only claude` first
+#   --percent <n>      pretend the session is at n% (for testing)
+#   --thresholds a,b,c use these thresholds instead of the widget settings
+#   --automation MODE  force automation on/off instead of the widget setting
+#   --dry-run          report the tier without touching settings or state
+#   --quiet            no desktop notification when the tier changes
+#
+# Triggered by the claude-effort-sync.path systemd user unit (whenever Omarchy
+# rewrites the usage record), by Claude Code's Stop/SessionStart hooks (with
+# --refresh), and by the Claude effort panel when settings change.
+
+set -euo pipefail
+
+export OMARCHY_PATH="${OMARCHY_PATH:-/usr/share/omarchy}"
+export PATH="$OMARCHY_PATH/bin:$PATH"
+
+USAGE_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/agents/usage/claude.json"
+SETTINGS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
+SHELL_JSON="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/shell.json"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/claude-effort-sync"
+STATE_FILE="$STATE_DIR/state.json"
+LOCK="${XDG_RUNTIME_DIR:-/tmp}/claude-effort-sync.lock"
+LIMIT_LABEL="Session (5-hour)"
+WIDGET_ID="io.github.gmantoha.claude-effort"
+
+xhigh_at=30 high_at=60 medium_at=80 automation=on
+refresh=false dry_run=false quiet=false forced_percent="" forced_thresholds="" forced_automation=""
+while (($#)); do
+  case "$1" in
+    --refresh) refresh=true ;;
+    --dry-run) dry_run=true ;;
+    --quiet) quiet=true ;;
+    --percent) forced_percent=${2:?--percent needs a value}; shift ;;
+    --thresholds) forced_thresholds=${2:?--thresholds needs a,b,c}; shift ;;
+    --automation) forced_automation=${2:?--automation needs on|off}; shift ;;
+    -h | --help) sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "claude-effort-sync: unknown argument: $1" >&2; exit 1 ;;
+  esac
+  shift
+done
+
+is_number() { [[ $1 =~ ^[0-9]+([.][0-9]+)?$ ]]; }
+
+# The thresholds and the on/off switch come from the bar widget's inline
+# entry in shell.json. A machine without the widget keeps the defaults.
+read_widget_settings() {
+  [[ -r $SHELL_JSON ]] || return 0
+  local a b c d
+  read -r a b c d <<<"$(jq -r --arg id "$WIDGET_ID" '
+    [ (.bar.layout // {}) | to_entries[] | .value | arrays | .[] | objects | select(.id == $id) ] | first // {}
+    | "\(.xhighAt // "-") \(.highAt // "-") \(.mediumAt // "-") \(.automation // "-")"
+  ' "$SHELL_JSON" 2>/dev/null || echo "- - - -")"
+  is_number "$a" && xhigh_at=$a
+  is_number "$b" && high_at=$b
+  is_number "$c" && medium_at=$c
+  [[ ${d,,} == off ]] && automation=off
+  return 0
+}
+
+apply_overrides() {
+  if [[ -n $forced_thresholds ]]; then
+    IFS=, read -r a b c <<<"$forced_thresholds"
+    is_number "${a:-}" && is_number "${b:-}" && is_number "${c:-}" \
+      || { echo "claude-effort-sync: --thresholds needs three numbers" >&2; exit 1; }
+    xhigh_at=$a high_at=$b medium_at=$c
+  fi
+  case "${forced_automation,,}" in
+    "") ;;
+    on | true | 1) automation=on ;;
+    off | false | 0) automation=off ;;
+    *) echo "claude-effort-sync: --automation needs on or off" >&2; exit 1 ;;
+  esac
+  # Thresholds only make sense in ascending order.
+  read -r xhigh_at high_at medium_at <<<"$(printf '%s\n' "$xhigh_at" "$high_at" "$medium_at" | sort -n | tr '\n' ' ')"
+  return 0
+}
+
+tier_for() {
+  awk -v p="$1" -v a="$xhigh_at" -v b="$high_at" -v c="$medium_at" 'BEGIN {
+    if (p < a) print "max"
+    else if (p < b) print "xhigh"
+    else if (p < c) print "high"
+    else print "medium"
+  }'
+}
+
+# Prints "<percent> <resets-at>" for the session window, or nothing when the
+# record has no session limit (signed out, offline since login, ...).
+read_session() {
+  [[ -r $USAGE_FILE ]] || return 0
+  jq -r --arg label "$LIMIT_LABEL" '
+    [.limits[]? | select(.label == $label)] | first // empty
+    | "\(.percent * 100) \(.resetsAt // "")"
+  ' "$USAGE_FILE" 2>/dev/null || true
+}
+
+# True when the window's reset time ($1, ISO 8601) has already passed.
+window_over() {
+  [[ -n ${1:-} ]] || return 1
+  local reset_epoch
+  reset_epoch=$(date -d "$1" +%s 2>/dev/null) || return 1
+  (( reset_epoch <= $(date +%s) ))
+}
+
+run_refresh() {
+  omarchy-agent-usage-update --limits-only claude >/dev/null 2>&1 || true
+}
+
+write_json_atomically() {  # $1 = destination; JSON on stdin
+  local dest=$1 tmp
+  mkdir -p "$(dirname "$dest")"
+  tmp=$(mktemp "$(dirname "$dest")/.$(basename "$dest").XXXXXX")
+  if cat >"$tmp"; then
+    [[ -e $dest ]] && chmod --reference="$dest" "$tmp" 2>/dev/null || true
+    mv "$tmp" "$dest"
+  else
+    rm -f "$tmp"
+    return 1
+  fi
+}
+
+write_state() {  # $1 = status, $2 = percent or empty, $3 = tier, $4 = cap, $5 = resetsAt
+  local usage_mtime=""
+  [[ -e $USAGE_FILE ]] && usage_mtime=$(date -u -r "$USAGE_FILE" +%FT%TZ)
+  jq -n \
+    --arg status "$1" --arg percent "$2" --arg tier "$3" --arg cap "$4" --arg resetsAt "$5" \
+    --arg automation "$automation" --arg usageUpdatedAt "$usage_mtime" --arg updatedAt "$(date -u +%FT%TZ)" \
+    --argjson xhighAt "$xhigh_at" --argjson highAt "$high_at" --argjson mediumAt "$medium_at" '
+    {
+      status: $status,
+      percent: (if $percent == "" then null else ($percent | tonumber) end),
+      tier: $tier,
+      cap: $cap,
+      automation: $automation,
+      resetsAt: $resetsAt,
+      usageUpdatedAt: $usageUpdatedAt,
+      updatedAt: $updatedAt,
+      thresholds: { xhighAt: $xhighAt, highAt: $highAt, mediumAt: $mediumAt }
+    }' | write_json_atomically "$STATE_FILE"
+}
+
+notify() {  # $1 = headline, $2 = body
+  $quiet && return 0
+  if command -v omarchy-notification-send >/dev/null; then
+    omarchy-notification-send --app-name "Claude effort" "$1" "$2" >/dev/null 2>&1 || true
+  else
+    notify-send -a "Claude effort" "$1" "$2" >/dev/null 2>&1 || true
+  fi
+}
+
+exec 9>"$LOCK"
+flock -w 30 9
+
+read_widget_settings
+apply_overrides
+
+$refresh && run_refresh
+
+percent="" resets_at="" status=ok
+if [[ -n $forced_percent ]]; then
+  percent=$forced_percent
+else
+  read -r percent resets_at <<<"$(read_session)"
+  if window_over "$resets_at" && ! $refresh; then
+    run_refresh
+    read -r percent resets_at <<<"$(read_session)"
+  fi
+  # A record that still describes a finished window means the new window is untouched.
+  if window_over "$resets_at"; then
+    percent=0
+    status=window-reset
+  fi
+fi
+
+current=$(jq -r '.maxEffortLevel // "unset"' "$SETTINGS" 2>/dev/null || echo unset)
+
+if [[ $automation == off ]]; then
+  tier=max
+  status=off
+  echo "claude-effort-sync: automation is off -> max (current cap: $current)"
+elif [[ -z $percent ]]; then
+  status=no-data
+  echo "claude-effort-sync: no '$LIMIT_LABEL' figure in $USAGE_FILE, leaving the cap at $current"
+  $dry_run || write_state "$status" "" "" "$current" ""
+  exit 0
+else
+  tier=$(tier_for "$percent")
+  printf 'claude-effort-sync: session usage %.1f%% -> %s (thresholds %s/%s/%s, current cap: %s)\n' \
+    "$percent" "$tier" "$xhigh_at" "$high_at" "$medium_at" "$current"
+fi
+
+$dry_run && exit 0
+
+if [[ $tier != "$current" ]]; then
+  jq --arg t "$tier" '.maxEffortLevel = $t' "$SETTINGS" | write_json_atomically "$SETTINGS" \
+    || { echo "claude-effort-sync: failed to update $SETTINGS" >&2; exit 1; }
+  if [[ $automation == off ]]; then
+    notify "Claude effort: max" "Automatic effort is off"
+  else
+    notify "Claude effort: $tier" "$(printf 'Claude session usage %.1f%%' "$percent")"
+  fi
+fi
+
+write_state "$status" "$percent" "$tier" "$tier" "$resets_at"
