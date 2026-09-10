@@ -12,6 +12,8 @@ as it fills up. Running sessions follow along without a restart.
 | 60 % to 79 %       | high   |
 | 80 % and up        | medium |
 
+![The Claude effort panel](preview.png)
+
 The thresholds are sliders in the panel. The panel sits next to Omarchy's
 Agents panel and shows the current tier, the session meter with the
 thresholds as notches, and the time until the window resets.
