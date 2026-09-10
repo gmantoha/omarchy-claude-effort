@@ -108,6 +108,22 @@ The sync script calls `omarchy agent usage-update --limits-only claude`, which i
 - After editing the plugin's QML, run `omarchy restart shell`; the shell does
   not always swap a running bar widget for the edited one.
 
+## Development
+
+`qmllint` ships with `qt6-declarative` but is not on PATH. The shell's
+`qs.*` modules resolve through a directory that contains a `qs` link to the
+shell root:
+
+```bash
+mkdir -p /tmp/qmlroot && ln -sfn "$OMARCHY_PATH/shell" /tmp/qmlroot/qs
+/usr/lib/qt6/bin/qmllint -I /tmp/qmlroot -I "$OMARCHY_PATH/shell" Panel.qml
+omarchy plugin validate .
+```
+
+The remaining `unqualified` and `missing-property` warnings come from the
+shell's dynamic `Style` singleton and inline components; the stock Agents
+panel reports the same ones.
+
 ## Uninstall
 
 ```bash
